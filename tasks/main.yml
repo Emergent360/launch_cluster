@@ -1,2 +1,110 @@
 ---
 # tasks file for launch_cluster
+- name: Get the VPC info for {{ ec2_name_prefix }}-vpc
+  ec2_vpc_net_info:
+    filters:
+      "tag:Name": "{{ ec2_name_prefix }}-vpc"
+    region: "{{ ec2_region }}"
+  register: vpc_net_facts
+
+- name: Set the VPC ID
+  set_fact:
+    vpc_id: "{{ vpc_net_facts.vpcs[0].id }}"
+
+- name: Get the SG info for {{ ec2_name_prefix }}-vpc
+  ec2_group_info:
+    filters:
+      vpc-id: "{{ vpc_id }}"
+    region: "{{ ec2_region }}"
+  register: group_info
+
+- name: Select Public SG
+  set_fact:
+    group_id: "{{ group_info.security_groups | json_query(group_query) }}"
+  vars:
+    group_query: "[?group_name=='{{ ec2_name_prefix }}-Public-SG'].group_id"
+  when: tier == "Public"
+
+- name: Select Private SG
+  set_fact:
+    group_id: "{{ group_info.security_groups | json_query(group_query) }}"
+  vars:
+    group_query: "[?group_name=='{{ ec2_name_prefix }}-Private-SG'].group_id"
+  when: tier == "Private"
+
+- name: Get the subnet info for {{ ec2_name_prefix }}-vpc
+  ec2_vpc_subnet_info:
+    region: "{{ ec2_region }}"
+    filters:
+      vpc-id: "{{ vpc_net_facts.vpcs[0].id }}"
+  register: subnet_info
+
+- name: Select Public subnets
+  set_fact:
+    subnet_data: "{{ subnet_info.subnets
+      | selectattr('tags.Name', 'search', '^.*-Public-.*$')
+      | list
+    }}"
+  when: tier == "Public"
+
+- name: Select Private subnets
+  set_fact:
+    subnet_data: "{{ subnet_info.subnets
+      | selectattr('tags.Name', 'search', '^.*-Private-.*$')
+      | list
+    }}"
+  when: tier == "Private"
+
+- name: Set subnet list
+  set_fact:
+    subnet_list: "{{ subnet_data | json_query(subnet_query) }}"
+  vars:
+    subnet_query: "[*].{id: subnet_id, name: tags.Name}"
+
+- name: "Find current, region-specific AMI."
+  ec2_ami_info:
+    region: "{{ ec2_region }}"
+    filters:
+      name: "{{ ami_name }}"
+  register: found_amis
+
+- name: "Set AMI value"
+  set_fact:
+    selected_ami: "{{ found_amis.images | selectattr('name', 'defined') | sort(attribute='creation_date') | last }}"
+  when: found_amis.images is defined
+
+- name: "Start instances."
+  ec2:
+    key_name: "{{ ec2_name_prefix }}-key"
+    region: "{{ ec2_region }}"
+    image: "{{ selected_ami.image_id }}"
+    instance_type: "{{ instance_type }}"
+    group_id: "{{ group_id }}"
+    vpc_subnet_id: "{{ item.id }}"
+    wait: yes
+    wait_timeout: 500
+    exact_count: "{{ instance_count }}"
+    count_tag:
+      Name: "{{ ec2_name_prefix }} server {{ item.name | regex_replace('^.*?-(.*)$', '\\1') }}"
+    instance_tags:
+      Role: service_cluster
+      Cluster: "{{ ec2_name_prefix }}"
+      Name: "{{ ec2_name_prefix }} server {{ item.name | regex_replace('^.*?-(.*)$', '\\1') }}"
+      Inventory: "{{ ec2_name_prefix }}"
+      Stage: "instantiated"
+      Platform: 
+      Zone: "{{ item.name | regex_replace('^.*-(.*)$', '\\1') }}"
+      Tier: "{{ item.name | regex_replace('^.*?-(.*?)-.*$', '\\1') }}"
+  loop: "{{ subnet_list }}"
+  loop_control:
+    label: "{{ item }}"
+  register: ec2
+
+- name: "Wait for connection on all hosts."
+  wait_for:
+    host: "{{ item.tagged_instances[0].private_ip }}"
+    port: 22
+    timeout: 300
+  loop: "{{ ec2.results }}"
+  loop_control:
+    label: "{{ item['tagged_instances'][0]['private_ip'] }}"

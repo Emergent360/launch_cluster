@@ -95,6 +95,7 @@
       Platform: "{{ platform }}"
       Zone: "{{ item.name | regex_replace('^.*-(.*)$', '\\1') }}"
       Tier: "{{ item.name | regex_replace('^.*?-(.*?)-.*$', '\\1') }}"
+    user_data: "{{ user_data }}"
   loop: "{{ subnet_list }}"
   loop_control:
     label: "{{ item }}"
